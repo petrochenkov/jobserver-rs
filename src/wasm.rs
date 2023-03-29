@@ -1,3 +1,4 @@
+use crate::FromEnvError;
 use std::io;
 use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex};
@@ -27,8 +28,8 @@ impl Client {
         })
     }
 
-    pub unsafe fn open(_s: &str) -> io::Result<Client> {
-        Err(io::ErrorKind::Unsupported.into())
+    pub unsafe fn open(_s: &str, _check_pipe: bool) -> Result<Client, FromEnvError> {
+        Err(FromEnvError::Unsupported)
     }
 
     pub fn acquire(&self) -> io::Result<Acquired> {

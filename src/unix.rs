@@ -1,5 +1,6 @@
 use libc::c_int;
 
+use crate::FromEnvError;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::mem;
@@ -81,29 +82,33 @@ impl Client {
         Ok(Client::from_fds(pipes[0], pipes[1]))
     }
 
-    pub unsafe fn open(s: &str, check_pipe: bool) -> io::Result<Client> {
+    pub unsafe fn open(s: &str, check_pipe: bool) -> Result<Client, FromEnvError> {
         if let Some(client) = Self::from_fifo(s)? {
             return Ok(client);
         }
         if let Some(client) = Self::from_pipe(s, check_pipe)? {
             return Ok(client);
         }
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "unrecognized format of environment variable",
-        ))
+        Err(FromEnvError::CannotParse(format!(
+            "expected `fifo:PATH` or `R,W`, found `{s}`"
+        )))
     }
 
     /// `--jobserver-auth=fifo:PATH`
-    fn from_fifo(s: &str) -> io::Result<Option<Client>> {
+    fn from_fifo(s: &str) -> Result<Option<Client>, FromEnvError> {
         let mut parts = s.splitn(2, ':');
         if parts.next().unwrap() != "fifo" {
             return Ok(None);
         }
-        let path = Path::new(parts.next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "expected ':' after `fifo`")
-        })?);
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let path_str = parts.next().ok_or_else(|| {
+            FromEnvError::CannotParse("expected a path after `fifo:`".to_string())
+        })?;
+        let path = Path::new(path_str);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|err| FromEnvError::CannotOpenPath(path_str.to_string(), err))?;
         Ok(Some(Client::Fifo {
             file,
             path: path.into(),
@@ -111,7 +116,7 @@ impl Client {
     }
 
     /// `--jobserver-auth=R,W`
-    unsafe fn from_pipe(s: &str, check_pipe: bool) -> io::Result<Option<Client>> {
+    unsafe fn from_pipe(s: &str, check_pipe: bool) -> Result<Option<Client>, FromEnvError> {
         let mut parts = s.splitn(2, ',');
         let read = parts.next().unwrap();
         let write = match parts.next() {
@@ -120,10 +125,10 @@ impl Client {
         };
         let read = read
             .parse()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(|e| FromEnvError::CannotParse(format!("cannot parse `read` fd: {e}")))?;
         let write = write
             .parse()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(|e| FromEnvError::CannotParse(format!("cannot parse `write` fd: {e}")))?;
 
         // Ok so we've got two integers that look like file descriptors, but
         // for extra sanity checking let's see if they actually look like
@@ -133,8 +138,12 @@ impl Client {
         // If we're called from `make` *without* the leading + on our rule
         // then we'll have `MAKEFLAGS` env vars but won't actually have
         // access to the file descriptors.
-        check_fd(read, check_pipe)?;
-        check_fd(write, check_pipe)?;
+        check_fd(read)?;
+        check_fd(write)?;
+        if check_pipe {
+            check_file_is_pipe(read)?;
+            check_file_is_pipe(write)?;
+        }
         drop(set_cloexec(read, true));
         drop(set_cloexec(write, true));
         Ok(Some(Client::from_fds(read, write)))
@@ -386,31 +395,29 @@ impl Helper {
     }
 }
 
-unsafe fn check_fd(fd: c_int, check_pipe: bool) -> io::Result<()> {
-    if check_pipe {
-        let mut stat = mem::zeroed();
-        if libc::fstat(fd, &mut stat) == -1 {
-            Err(io::Error::last_os_error())
-        } else {
-            // On android arm and i686 mode_t is u16 and st_mode is u32,
-            // this generates a type mismatch when S_IFIFO (declared as mode_t)
-            // is used in operations with st_mode, so we use this workaround
-            // to get the value of S_IFIFO with the same type of st_mode.
-            let mut s_ififo = stat.st_mode;
-            s_ififo = libc::S_IFIFO as _;
-            if stat.st_mode & s_ififo == s_ififo {
-                return Ok(());
-            }
-            Err(io::Error::last_os_error()) //
-        }
+unsafe fn check_fd(fd: c_int) -> Result<(), FromEnvError> {
+    match libc::fcntl(fd, libc::F_GETFD) {
+        -1 => Err(FromEnvError::CannotOpenFd(fd, io::Error::last_os_error())),
+        _ => Ok(()),
+    }
+}
+
+unsafe fn check_file_is_pipe(fd: c_int) -> Result<(), FromEnvError> {
+    let mut stat = mem::zeroed();
+    if libc::fstat(fd, &mut stat) == -1 {
+        Err(FromEnvError::CannotOpenFd(fd, io::Error::last_os_error()))
     } else {
-        match libc::fcntl(fd, libc::F_GETFD) {
-            r if r == -1 => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{fd} is not a pipe"),
-            )),
-            _ => Ok(()),
+        // On android arm and i686 mode_t is u16 and st_mode is u32,
+        // this generates a type mismatch when S_IFIFO (declared as mode_t)
+        // is used in operations with st_mode, so we use this workaround
+        // to get the value of S_IFIFO with the same type of st_mode.
+        #[allow(unused_assignments)]
+        let mut s_ififo = stat.st_mode;
+        s_ififo = libc::S_IFIFO as _;
+        if stat.st_mode & s_ififo == s_ififo {
+            return Ok(());
         }
+        Err(FromEnvError::NotAPipe(fd))
     }
 }
 

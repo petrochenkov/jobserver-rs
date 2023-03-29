@@ -82,6 +82,7 @@
 #![doc(html_root_url = "https://docs.rs/jobserver/0.1")]
 
 use std::env;
+use std::ffi::OsString;
 use std::io;
 use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -151,40 +152,77 @@ struct HelperInner {
     consumer_done: bool,
 }
 
-/// Error type for `from_env` function.
+/// Return type for `from_env_ext` function.
 #[derive(Debug)]
-pub enum ErrFromEnv {
-    /// There isn't env var, that describes jobserver to inherit.
-    IsNotConfigured,
-    /// Cannot connect following this process's environment.
-    PlatformSpecific {
-        /// Error.
-        err: io::Error,
-        /// Name of gotten env var.
-        env: &'static str,
-        /// Value of gotten env var.
-        var: String,
-    },
+pub struct FromEnv {
+    /// Result of trying to get jobserver client from env.
+    pub client: Result<Client, FromEnvError>,
+    /// Name of the environment variable.
+    /// Empty if no relevant environment variable is found.
+    pub var_name: &'static str,
+    /// Value of the environment variable.
+    /// Empty if no relevant environment variable is found.
+    pub var_value: OsString,
 }
 
-impl std::fmt::Display for ErrFromEnv {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ErrFromEnv::IsNotConfigured => {
-                write!(f, "couldn't find relevant environment variable")
-            }
-            ErrFromEnv::PlatformSpecific { err, env, var } => {
-                write!(f, "{err} ({env}={var}")
-            }
+/// Error type for `from_env_ext` function.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum FromEnvError {
+    /// There is no environment variable that describes jobserver to inherit.
+    NoEnvVar,
+    /// Cannot parse jobserver environment variable value, incorrect format.
+    CannotParse(String),
+    /// Cannot open path or name from the jobserver environment variable value.
+    CannotOpenPath(String, io::Error),
+    /// Cannot open file descriptor from the jobserver environment variable value.
+    CannotOpenFd(std::os::fd::RawFd, io::Error),
+    /// File descriptor from the jobserver environment variable value is not a pipe.
+    NotAPipe(std::os::fd::RawFd),
+    /// Jobserver inheritance is not supported on this platform.
+    Unsupported,
+}
+
+impl FromEnv {
+    fn new_ok(client: Client, var_name: &'static str, var_value: OsString) -> FromEnv {
+        let client = Ok(client);
+        FromEnv {
+            client,
+            var_name,
+            var_value,
+        }
+    }
+    fn new_err(kind: FromEnvError, var_name: &'static str, var_value: OsString) -> FromEnv {
+        let client = Err(kind);
+        FromEnv {
+            client,
+            var_name,
+            var_value,
         }
     }
 }
 
-impl std::error::Error for ErrFromEnv {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl std::fmt::Display for FromEnvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ErrFromEnv::IsNotConfigured => None,
-            ErrFromEnv::PlatformSpecific { err, .. } => Some(err),
+            FromEnvError::NoEnvVar => write!(f, "there is no environment variable that describes jobserver to inherit"),
+            FromEnvError::CannotParse(s) => write!(f, "cannot parse jobserver environment variable value: {s}"),
+            FromEnvError::CannotOpenPath(s, err) => write!(f, "cannot open path or name {s} from the jobserver environment variable value: {err}"),
+            FromEnvError::CannotOpenFd(fd, err) => write!(f, "cannot open file descriptor {fd} from the jobserver environment variable value: {err}"),
+            FromEnvError::NotAPipe(fd) => write!(f, "file descriptor {fd} from the jobserver environment variable value is not a pipe"),
+            FromEnvError::Unsupported => write!(f, "jobserver inheritance is not supported on this platform"),
+        }
+    }
+}
+
+impl std::error::Error for FromEnvError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self {
+            FromEnvError::CannotOpenPath(_, err) | FromEnvError::CannotOpenFd(_, err) => Some(err),
+            FromEnvError::NoEnvVar
+            | FromEnvError::CannotParse(_)
+            | FromEnvError::NotAPipe(_)
+            | FromEnvError::Unsupported => None,
         }
     }
 }
@@ -234,10 +272,10 @@ impl Client {
     ///
     /// # Return value
     ///
+    /// `FromEnv` contains result and relevant `var_name` with `var_value`.
     /// If a jobserver was found in the environment and it looks correct then
-    /// `Ok` of the connected client will be returned. If no relevant env var
-    /// was found then `Err(IsNotConfigured)` will be returned. In other cases
-    /// `Err(PlatformSpecific)` will be returned.
+    /// result with the connected client will be returned. In other cases
+    /// result will contain `Err(FromEnvErr)`.
     ///
     /// Note that on Unix the `Client` returned **takes ownership of the file
     /// descriptors specified in the environment**. Jobservers on Unix are
@@ -250,8 +288,8 @@ impl Client {
     /// with `CLOEXEC` so they're not automatically inherited by spawned
     /// children.
     ///
-    /// On unix if `unix_check_is_pipe` enabled this function will check if
-    /// provided files are actually pipes.
+    /// On unix if `check_pipe` enabled this function will check if provided
+    /// files are actually pipes.
     ///
     /// # Safety
     ///
@@ -269,27 +307,42 @@ impl Client {
     ///
     /// Note, though, that on Windows it should be safe to call this function
     /// any number of times.
-    pub unsafe fn from_env_ext(check_pipe: bool) -> Result<Client, ErrFromEnv> {
-        let (env, var) = ["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"]
+    pub unsafe fn from_env_ext(check_pipe: bool) -> FromEnv {
+        let (env, var_os) = match ["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"]
             .iter()
-            .map(|&env| env::var(env).map(|var| (env, var)))
-            .find_map(|p| p.ok())
-            .ok_or(ErrFromEnv::IsNotConfigured)?;
+            .map(|&env| env::var_os(env).map(|var| (env, var)))
+            .find_map(|p| p)
+        {
+            Some((env, var_os)) => (env, var_os),
+            None => return FromEnv::new_err(FromEnvError::NoEnvVar, "", Default::default()),
+        };
 
-        let (arg, pos) = ["--jobserver-fds=", "--jobserver-auth="]
+        let var = match var_os.to_str() {
+            Some(var) => var,
+            None => {
+                let err = FromEnvError::CannotParse("not a valid UTF-8".to_string());
+                return FromEnv::new_err(err, env, var_os);
+            }
+        };
+
+        let (arg, pos) = match ["--jobserver-fds=", "--jobserver-auth="]
             .iter()
             .map(|&arg| var.find(arg).map(|pos| (arg, pos)))
             .find_map(|pos| pos)
-            .ok_or(ErrFromEnv::IsNotConfigured)?;
+        {
+            Some((arg, pos)) => (arg, pos),
+            None => {
+                let err = FromEnvError::CannotParse(
+                    "expected `--jobserver-fds=` or `--jobserver-auth=`".to_string(),
+                );
+                return FromEnv::new_err(err, env, var_os);
+            }
+        };
 
         let s = var[pos + arg.len()..].split(' ').next().unwrap();
-        #[cfg(unix)]
-        let imp_client = imp::Client::open(s, check_pipe);
-        #[cfg(not(unix))]
-        let imp_client = imp::Client::open(s);
-        match imp_client {
-            Ok(c) => Ok(Client { inner: Arc::new(c) }),
-            Err(err) => Err(ErrFromEnv::PlatformSpecific { err, env, var }),
+        match imp::Client::open(s, check_pipe) {
+            Ok(c) => FromEnv::new_ok(Client { inner: Arc::new(c) }, env, var_os),
+            Err(err) => FromEnv::new_err(err, env, var_os),
         }
     }
 
@@ -298,7 +351,7 @@ impl Client {
     ///
     /// Wraps `from_env_ext` and discards error details.
     pub unsafe fn from_env() -> Option<Client> {
-        Self::from_env_ext(false).ok()
+        Self::from_env_ext(false).client.ok()
     }
 
     /// Acquires a token from this jobserver client.
