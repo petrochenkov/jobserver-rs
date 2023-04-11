@@ -139,13 +139,14 @@ impl Client {
         // then we'll have `MAKEFLAGS` env vars but won't actually have
         // access to the file descriptors.
         //
-        // Emit furthest error, cause it's most significant.
-        let err_read = check_fd(read).and_then(|()| check_file_is_pipe(read, check_pipe));
-        let err_write = check_fd(write).and_then(|()| check_file_is_pipe(write, check_pipe));
-        match (error_priority(&err_read), error_priority(&err_write)) {
-            (0, 0) => {}
-            (r, w) if r > w => err_read?,
-            _ => err_write?,
+        // `NotAPipe` is a worse error, return it if it's reported for any of the two fds.
+        match (fd_check(read, check_pipe), fd_check(write, check_pipe)) {
+            (read_err @ Err(FromEnvError::NotAPipe(..)), _) => read_err?,
+            (_, write_err @ Err(FromEnvError::NotAPipe(..))) => write_err?,
+            (read_err, write_err) => {
+                read_err?;
+                write_err?;
+            }
         }
 
         drop(set_cloexec(read, true));
@@ -399,42 +400,35 @@ impl Helper {
     }
 }
 
-unsafe fn check_fd(fd: c_int) -> Result<(), FromEnvError> {
+unsafe fn fcntl_check(fd: c_int) -> Result<(), FromEnvError> {
     match libc::fcntl(fd, libc::F_GETFD) {
         -1 => Err(FromEnvError::CannotOpenFd(fd, io::Error::last_os_error())),
         _ => Ok(()),
     }
 }
 
-unsafe fn check_file_is_pipe(fd: c_int, check: bool) -> Result<(), FromEnvError> {
-    if !check {
-        return Ok(());
-    }
-    let mut stat = mem::zeroed();
-    if libc::fstat(fd, &mut stat) == -1 {
-        Err(FromEnvError::NotAPipe(fd, Some(io::Error::last_os_error())))
-    } else {
-        // On android arm and i686 mode_t is u16 and st_mode is u32,
-        // this generates a type mismatch when S_IFIFO (declared as mode_t)
-        // is used in operations with st_mode, so we use this workaround
-        // to get the value of S_IFIFO with the same type of st_mode.
-        #[allow(unused_assignments)]
-        let mut s_ififo = stat.st_mode;
-        s_ififo = libc::S_IFIFO as _;
-        if stat.st_mode & s_ififo == s_ififo {
-            return Ok(());
+unsafe fn fd_check(fd: c_int, check_pipe: bool) -> Result<(), FromEnvError> {
+    if check_pipe {
+        let mut stat = mem::zeroed();
+        if libc::fstat(fd, &mut stat) == -1 {
+            let last_os_error = io::Error::last_os_error();
+            fcntl_check(fd)?;
+            Err(FromEnvError::NotAPipe(fd, Some(last_os_error)))
+        } else {
+            // On android arm and i686 mode_t is u16 and st_mode is u32,
+            // this generates a type mismatch when S_IFIFO (declared as mode_t)
+            // is used in operations with st_mode, so we use this workaround
+            // to get the value of S_IFIFO with the same type of st_mode.
+            #[allow(unused_assignments)]
+            let mut s_ififo = stat.st_mode;
+            s_ififo = libc::S_IFIFO as _;
+            if stat.st_mode & s_ififo == s_ififo {
+                return Ok(());
+            }
+            Err(FromEnvError::NotAPipe(fd, None))
         }
-        Err(FromEnvError::NotAPipe(fd, None))
-    }
-}
-
-// For `from_pipe` error selection.
-fn error_priority(err: &Result<(), FromEnvError>) -> usize {
-    match err {
-        Err(FromEnvError::NotAPipe(_, None)) => 3,
-        Err(FromEnvError::NotAPipe(_, Some(_))) => 2,
-        Err(FromEnvError::CannotOpenFd(_, _)) => 1,
-        _ => 0,
+    } else {
+        fcntl_check(fd)
     }
 }
 
