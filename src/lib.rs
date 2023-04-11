@@ -178,7 +178,7 @@ pub enum FromEnvError {
     /// Cannot open file descriptor from the jobserver environment variable value.
     CannotOpenFd(std::os::fd::RawFd, io::Error),
     /// File descriptor from the jobserver environment variable value is not a pipe.
-    NotAPipe(std::os::fd::RawFd),
+    NotAPipe(std::os::fd::RawFd, Option<io::Error>),
     /// Jobserver inheritance is not supported on this platform.
     Unsupported,
 }
@@ -209,7 +209,8 @@ impl std::fmt::Display for FromEnvError {
             FromEnvError::CannotParse(s) => write!(f, "cannot parse jobserver environment variable value: {s}"),
             FromEnvError::CannotOpenPath(s, err) => write!(f, "cannot open path or name {s} from the jobserver environment variable value: {err}"),
             FromEnvError::CannotOpenFd(fd, err) => write!(f, "cannot open file descriptor {fd} from the jobserver environment variable value: {err}"),
-            FromEnvError::NotAPipe(fd) => write!(f, "file descriptor {fd} from the jobserver environment variable value is not a pipe"),
+            FromEnvError::NotAPipe(fd, None) => write!(f, "file descriptor {fd} from the jobserver environment variable value is not a pipe"),
+            FromEnvError::NotAPipe(fd, Some(err)) => write!(f, "file descriptor {fd} from the jobserver environment variable value is not a pipe: {err}"),
             FromEnvError::Unsupported => write!(f, "jobserver inheritance is not supported on this platform"),
         }
     }
@@ -218,10 +219,12 @@ impl std::fmt::Display for FromEnvError {
 impl std::error::Error for FromEnvError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self {
-            FromEnvError::CannotOpenPath(_, err) | FromEnvError::CannotOpenFd(_, err) => Some(err),
+            FromEnvError::CannotOpenPath(_, err)
+            | FromEnvError::CannotOpenFd(_, err)
+            | FromEnvError::NotAPipe(_, Some(err)) => Some(err),
             FromEnvError::NoEnvVar
             | FromEnvError::CannotParse(_)
-            | FromEnvError::NotAPipe(_)
+            | FromEnvError::NotAPipe(_, None)
             | FromEnvError::Unsupported => None,
         }
     }

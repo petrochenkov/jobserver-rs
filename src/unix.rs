@@ -132,18 +132,22 @@ impl Client {
 
         // Ok so we've got two integers that look like file descriptors, but
         // for extra sanity checking let's see if they actually look like
-        // instances of a pipe if feature enabled or valid files otherwise
-        // before we return the client.
+        // valid files and instances of a pipe if feature enabled before we
+        // return the client.
         //
         // If we're called from `make` *without* the leading + on our rule
         // then we'll have `MAKEFLAGS` env vars but won't actually have
         // access to the file descriptors.
-        check_fd(read)?;
-        check_fd(write)?;
-        if check_pipe {
-            check_file_is_pipe(read)?;
-            check_file_is_pipe(write)?;
+        //
+        // Emit furthest error, cause it's most significant.
+        let err_read = check_fd(read).and_then(|()| check_file_is_pipe(read, check_pipe));
+        let err_write = check_fd(write).and_then(|()| check_file_is_pipe(write, check_pipe));
+        match (error_priority(&err_read), error_priority(&err_write)) {
+            (0, 0) => {}
+            (r, w) if r > w => err_read?,
+            _ => err_write?,
         }
+
         drop(set_cloexec(read, true));
         drop(set_cloexec(write, true));
         Ok(Some(Client::from_fds(read, write)))
@@ -402,10 +406,13 @@ unsafe fn check_fd(fd: c_int) -> Result<(), FromEnvError> {
     }
 }
 
-unsafe fn check_file_is_pipe(fd: c_int) -> Result<(), FromEnvError> {
+unsafe fn check_file_is_pipe(fd: c_int, check: bool) -> Result<(), FromEnvError> {
+    if !check {
+        return Ok(());
+    }
     let mut stat = mem::zeroed();
     if libc::fstat(fd, &mut stat) == -1 {
-        Err(FromEnvError::CannotOpenFd(fd, io::Error::last_os_error()))
+        Err(FromEnvError::NotAPipe(fd, Some(io::Error::last_os_error())))
     } else {
         // On android arm and i686 mode_t is u16 and st_mode is u32,
         // this generates a type mismatch when S_IFIFO (declared as mode_t)
@@ -417,7 +424,17 @@ unsafe fn check_file_is_pipe(fd: c_int) -> Result<(), FromEnvError> {
         if stat.st_mode & s_ififo == s_ififo {
             return Ok(());
         }
-        Err(FromEnvError::NotAPipe(fd))
+        Err(FromEnvError::NotAPipe(fd, None))
+    }
+}
+
+// For `from_pipe` error selection.
+fn error_priority(err: &Result<(), FromEnvError>) -> usize {
+    match err {
+        Err(FromEnvError::NotAPipe(_, None)) => 3,
+        Err(FromEnvError::NotAPipe(_, Some(_))) => 2,
+        Err(FromEnvError::CannotOpenFd(_, _)) => 1,
+        _ => 0,
     }
 }
 
